@@ -1,0 +1,20 @@
+Required Arduino Libraries
+===========================
+
+Install via Arduino IDE Library Manager (Sketch > Include Library > Manage Libraries)
+or via arduino-cli:
+
+- ESP32 Board Package (esp32 by Espressif Systems) — v2.0.x or later
+- Adafruit GFX Library
+- Adafruit SSD1306
+- BLE (bundled with ESP32 board package — BLEDevice, BLEScan, BLEAdvertisedDevice)
+- EEPROM (bundled with ESP32 board package)
+- HTTPClient (bundled with ESP32 board package)
+- WiFi (bundled with ESP32 board package)
+
+Board setting: "ESP32 Dev Module" (or your specific ESP32 board variant)
+Partition scheme: Default 4MB with spiffs (or any scheme with OTA disabled is fine)
+
+arduino-cli install example:
+  arduino-cli lib install "Adafruit GFX Library"
+  arduino-cli lib install "Adafruit SSD1306"
