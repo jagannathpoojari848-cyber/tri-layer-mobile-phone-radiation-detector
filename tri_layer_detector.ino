@@ -1,317 +1,539 @@
-/*
- * Tri-Layer Smart Mobile Phone Detection System
- * ------------------------------------------------
- * ESP32 dual-core FreeRTOS firmware.
- *
- *  Core 1: RF energy sensing (CA3130 front-end) -> median filter -> debounce
- *  Core 0: WiFi 802.11 promiscuous sniffing + BLE scanning -> MAC whitelist check
- *
- * Both layers feed a weighted threat-scoring engine whose output (0-100%,
- * SAFE / WARNING / CRITICAL) is shown on an OLED and pushed to ThingSpeak.
- *
- * Hardware: ESP32 dev board, CA3130-based RF detector, SSD1306 OLED,
- *           buzzer + 3 status LEDs, calibration push button.
- */
+// ============================================================
+//  Tri-Layer Smart Mobile Phone Detector — THINGSPEAK FIXED
+//  ESP32-WROOM-32 | MGIT ECE Major Project
+//  Using HTTP (not HTTPS) for more reliable uploads
+// ============================================================
 
 #include <WiFi.h>
-#include <esp_wifi.h>
+#include <HTTPClient.h>  // Use HTTPClient instead of ThingSpeak library
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include <HTTPClient.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
-#include "config.h"
-#include "whitelist.h"
-#include "threat_score.h"
+// ─── OLED ────────────────────────────────────────────────────
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ---------------------------------------------------------------------
-// Globals shared between cores (protected by mutex where written/read
-// from both tasks)
-// ---------------------------------------------------------------------
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
-Whitelist whitelist;
-ThreatScorer scorer;
+// ─── Pins ────────────────────────────────────────────────────
+#define RF_PIN        34
+#define BUZZER        25
+#define ENROLL_BTN     4
+#define BATTERY_PIN   35
 
-SemaphoreHandle_t scoreMutex;
+// ─── WiFi Credentials ────────────────────────────────────────
+const char* ssid      = "your ssid ";
+const char* password  = "your password ";
 
-volatile int g_rfScore = 0;      // 0-100, written by Core 1
-volatile int g_wifiScore = 0;    // 0-100, written by Core 0
-volatile int g_bleScore = 0;     // 0-100, written by Core 0
-volatile int g_combinedScore = 0;
-volatile ThreatLevel g_level = SAFE;
-volatile bool g_calibrationMode = false;
+// ─── ESP32 Hotspot ───────────────────────────────────────────
+#define AP_SSID "ExamHall_Monitor"
+#define AP_PASS "mgit1234"
 
-int rfBaseline = 1800; // updated during calibration
+// ─── ThingSpeak ─────────────────────────────────────────────
+unsigned long CH_ID    = xxxxx;
+const char* CH_WRITE = "xxxxxxxx";
 
-// ---------------------------------------------------------------------
-// RF Sensing (Core 1)
-// ---------------------------------------------------------------------
-int medianFilter(int *buf, int n) {
-  int tmp[RF_MEDIAN_FILTER_SIZE];
-  memcpy(tmp, buf, n * sizeof(int));
-  // simple insertion sort - n is small (7)
-  for (int i = 1; i < n; i++) {
-    int key = tmp[i], j = i - 1;
-    while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
-    tmp[j + 1] = key;
-  }
-  return tmp[n / 2];
-}
+#define TS_INTERVAL   15000
+unsigned long lastUpload = 0;
 
-void rfSensingTask(void *param) {
-  int samples[RF_MEDIAN_FILTER_SIZE];
-  int sampleIdx = 0;
-  int debounceCounter = 0;
+// ─── BLE ─────────────────────────────────────────────────────
+BLEScan* pBLEScan;
 
-  for (;;) {
-    samples[sampleIdx % RF_MEDIAN_FILTER_SIZE] = analogRead(RF_SENSOR_PIN);
-    sampleIdx++;
+// ─── Whitelist ───────────────────────────────────────────────
+#define MAX_WHITELIST  10
+#define MAC_LEN        18
+#define EEPROM_SIZE    512
+String whitelist[MAX_WHITELIST];
+int    whitelistCount = 0;
 
-    if (sampleIdx >= RF_MEDIAN_FILTER_SIZE) {
-      int filtered = medianFilter(samples, RF_MEDIAN_FILTER_SIZE);
+// ─── RF Settings ─────────────────────────────────────────────
+#define RF_THRESHOLD        1800
+#define RF_SAMPLES            20
+#define RF_DEBOUNCE_COUNT      3
+#define EXTRA_RF_THRESHOLD   150
+#define GSM_BURST_MIN        180
+#define GSM_BURST_MAX        250
+#define RSSI_NEAR            -65
 
-      if (g_calibrationMode) {
-        rfBaseline = filtered; // teacher/admin device sets the ambient baseline
-      }
+// ─── Promiscuous Sniffer ─────────────────────────────────────
+#define MAX_SNIFFED    20
+#define SNIFF_DURATION 3000
+struct SniffedDevice { String mac; int rssi; unsigned long lastSeen; };
+SniffedDevice     sniffBuffer[MAX_SNIFFED];
+int               sniffCount = 0;
+SemaphoreHandle_t sniffMutex;
 
-      int delta = filtered - rfBaseline;
-      bool hit = delta > RF_BASELINE_MARGIN;
+// ─── Threat Score ────────────────────────────────────────────
+struct ThreatScore { int score; String level; String reason; };
 
-      if (hit) {
-        debounceCounter++;
-      } else {
-        debounceCounter = max(0, debounceCounter - 1);
-      }
-      debounceCounter = min(debounceCounter, RF_DEBOUNCE_COUNT * 2);
+// ─── RF State ────────────────────────────────────────────────
+struct RFState { int raw; int averaged; float burstRate; int debounceCount; bool confirmed; };
+RFState rfState = {0, 0, 0, 0, false};
 
-      int score = 0;
-      if (debounceCounter >= RF_DEBOUNCE_COUNT) {
-        // scale confidence with how far past the debounce threshold we are
-        score = map(constrain(debounceCounter, RF_DEBOUNCE_COUNT, RF_DEBOUNCE_COUNT * 2),
-                    RF_DEBOUNCE_COUNT, RF_DEBOUNCE_COUNT * 2, 60, 100);
-      }
+// ─── Baseline ────────────────────────────────────────────────
+float teacherBaseline = 0;
+bool  baselineSet     = false;
 
-      xSemaphoreTake(scoreMutex, portMAX_DELAY);
-      g_rfScore = score;
-      xSemaphoreGive(scoreMutex);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(RF_SAMPLE_WINDOW_MS));
-  }
-}
-
-// ---------------------------------------------------------------------
-// WiFi 802.11 Promiscuous Sniffing (Core 0)
-// ---------------------------------------------------------------------
-volatile int g_unknownWifiDevices = 0;
-
-typedef struct {
-  uint8_t frame_ctrl[2];
-  uint8_t duration[2];
-  uint8_t addr1[6]; // receiver
-  uint8_t addr2[6]; // sender / transmitter
-  uint8_t addr3[6];
-} wifi_hdr_t;
-
-void IRAM_ATTR wifiSnifferCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
-  if (type != WIFI_PKT_MGMT) return;
-
-  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-  wifi_hdr_t *hdr = (wifi_hdr_t *)pkt->payload;
-
-  // Only interested in probe requests / association-related frames from
-  // the sender address (addr2), which identifies the transmitting device.
-  if (!whitelist.isWhitelisted(hdr->addr2)) {
-    g_unknownWifiDevices++;
-  }
-}
-
-void wifiScanTask(void *param) {
-  const uint8_t channels[] = {1, 6, 11}; // common channels, hop between them
-  int chIdx = 0;
-
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&wifiSnifferCallback);
-
-  TickType_t lastDecay = xTaskGetTickCount();
-
-  for (;;) {
-    esp_wifi_set_channel(channels[chIdx], WIFI_SECOND_CHAN_NONE);
-    chIdx = (chIdx + 1) % (sizeof(channels) / sizeof(channels[0]));
-
-    vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_CHANNEL_HOP_MS));
-
-    // Every full channel sweep, convert unknown-device count into a score
-    // and decay the counter so it reflects a rolling window, not a
-    // lifetime total.
-    if (chIdx == 0) {
-      int count = g_unknownWifiDevices;
-      g_unknownWifiDevices = 0;
-
-      int score = constrain(map(count, 0, 8, 0, 100), 0, 100);
-
-      xSemaphoreTake(scoreMutex, portMAX_DELAY);
-      g_wifiScore = score;
-      xSemaphoreGive(scoreMutex);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------
-// BLE Scanning (Core 0, cooperatively scheduled with WiFi task)
-// ---------------------------------------------------------------------
-class BleCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    uint8_t mac[6];
-    memcpy(mac, advertisedDevice.getAddress().getNative(), 6);
-    if (!whitelist.isWhitelisted(mac)) {
-      unknownCount++;
-    }
-  }
-public:
-  int unknownCount = 0;
+// ─── Shared Scan Results ─────────────────────────────────────
+SemaphoreHandle_t resultMutex;
+struct ScanResults {
+  int  knownWiFi; int unknownWiFi;
+  int  knownBLE;  int unknownBLE;
+  int  sniffedUnknown; int sniffedKnown;
+  bool teacherOnHotspot;
 };
+ScanResults scanResults = {0,0,0,0,0,0,false};
 
-void bleScanTask(void *param) {
-  BLEDevice::init("");
-  BLEScan *pBLEScan = BLEDevice::getScan();
-  BleCallbacks cb;
-  pBLEScan->setAdvertisedDeviceCallbacks(&cb);
-  pBLEScan->setActiveScan(true);
+// ─── Statistics ──────────────────────────────────────────────
+int           totalAlerts      = 0;
+int           knownDevicesSeen = 0;
+int           peakRF           = 0;
+int           peakScore        = 0;
+unsigned long teacherStartTime = 0;
 
-  for (;;) {
-    cb.unknownCount = 0;
-    pBLEScan->start(BLE_SCAN_DURATION_S, false);
+// ─── State ───────────────────────────────────────────────────
+bool   enrollMode  = false;
+unsigned long enrollStart = 0;
+bool   prevTeacher = false;
+int    currentScore = 0;
+String currentLevel = "SAFE";
+
+// ============================================================
+//  WiFi Promiscuous Sniffer
+// ============================================================
+typedef struct {
+  uint8_t frame_ctrl[2]; uint8_t duration[2];
+  uint8_t addr1[6]; uint8_t addr2[6]; uint8_t addr3[6]; uint8_t seq_ctrl[2];
+} wifi_mac_hdr_t;
+typedef struct { wifi_mac_hdr_t hdr; uint8_t payload[0]; } wifi_packet_t;
+
+void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+  wifi_promiscuous_pkt_t* pkt  = (wifi_promiscuous_pkt_t*)buf;
+  wifi_packet_t* ipkt = (wifi_packet_t*)pkt->payload;
+  wifi_mac_hdr_t* hdr  = &ipkt->hdr;
+  int rssi = pkt->rx_ctrl.rssi;
+  if (rssi < RSSI_NEAR)     return;
+  if (hdr->addr2[0] & 0x01) return;
+  if (hdr->addr2[0] & 0x02) return;
+  char mac[18];
+  sprintf(mac,"%02X:%02X:%02X:%02X:%02X:%02X",
+    hdr->addr2[0],hdr->addr2[1],hdr->addr2[2],
+    hdr->addr2[3],hdr->addr2[4],hdr->addr2[5]);
+  String macStr = String(mac);
+  if (xSemaphoreTake(sniffMutex, 0) == pdTRUE) {
+    bool found = false;
+    for (int i=0;i<sniffCount;i++) {
+      if (sniffBuffer[i].mac==macStr) { sniffBuffer[i].rssi=rssi; sniffBuffer[i].lastSeen=millis(); found=true; break; }
+    }
+    if (!found && sniffCount<MAX_SNIFFED)
+      sniffBuffer[sniffCount++]={macStr,rssi,millis()};
+    xSemaphoreGive(sniffMutex);
+  }
+}
+void startSniffing() {
+  if (xSemaphoreTake(sniffMutex,100)==pdTRUE){sniffCount=0;xSemaphoreGive(sniffMutex);}
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
+}
+void stopSniffing() { esp_wifi_set_promiscuous(false); }
+
+// ============================================================
+//  EEPROM Whitelist
+// ============================================================
+void saveWhitelist() {
+  int addr=0; EEPROM.write(addr++,whitelistCount);
+  for(int i=0;i<whitelistCount;i++){
+    String mac=whitelist[i];
+    for(int j=0;j<MAC_LEN;j++) EEPROM.write(addr++,j<(int)mac.length()?mac[j]:0);
+  }
+  EEPROM.commit();
+}
+void loadWhitelist() {
+  int addr=0; int count=EEPROM.read(addr++);
+  if(count<0||count>MAX_WHITELIST){whitelistCount=0;return;}
+  whitelistCount=count;
+  for(int i=0;i<whitelistCount;i++){
+    String mac="";
+    for(int j=0;j<MAC_LEN;j++){char c=EEPROM.read(addr++);if(c!=0)mac+=c;}
+    whitelist[i]=mac;
+  }
+}
+bool isWhitelisted(String mac) {
+  mac.toUpperCase();
+  for(int i=0;i<whitelistCount;i++) if(whitelist[i]==mac) return true;
+  return false;
+}
+void addToWhitelist(String mac) {
+  mac.toUpperCase();
+  if(whitelistCount>=MAX_WHITELIST||isWhitelisted(mac)) return;
+  whitelist[whitelistCount++]=mac; saveWhitelist();
+}
+
+// ============================================================
+//  RF Functions
+// ============================================================
+int readRFAveraged() {
+  int s[RF_SAMPLES];
+  for(int i=0;i<RF_SAMPLES;i++){s[i]=analogRead(RF_PIN);delay(2);}
+  for(int i=0;i<RF_SAMPLES-1;i++)
+    for(int j=0;j<RF_SAMPLES-i-1;j++)
+      if(s[j]>s[j+1]){int t=s[j];s[j]=s[j+1];s[j+1]=t;}
+  return s[RF_SAMPLES/2];
+}
+float detectGSMBurst() {
+  int count=0; unsigned long start=millis();
+  while(millis()-start<1000){if(analogRead(RF_PIN)>RF_THRESHOLD)count++;delay(2);}
+  return count;
+}
+bool checkRFDebounced() {
+  int reading=readRFAveraged(); rfState.averaged=reading;
+  if(reading>peakRF) peakRF=reading;
+  if(reading>RF_THRESHOLD){
+    rfState.debounceCount++;
+    if(rfState.debounceCount>=RF_DEBOUNCE_COUNT) rfState.confirmed=true;
+  } else { rfState.debounceCount=0; rfState.confirmed=false; }
+  return rfState.confirmed;
+}
+
+// ============================================================
+//  Hotspot Check
+// ============================================================
+bool isTeacherOnHotspot() {
+  wifi_sta_list_t list; esp_wifi_ap_get_sta_list(&list);
+  for(int i=0;i<list.num;i++){
+    char mac[18];
+    sprintf(mac,"%02X:%02X:%02X:%02X:%02X:%02X",
+      list.sta[i].mac[0],list.sta[i].mac[1],list.sta[i].mac[2],
+      list.sta[i].mac[3],list.sta[i].mac[4],list.sta[i].mac[5]);
+    if(isWhitelisted(String(mac))) return true;
+  }
+  return false;
+}
+
+// ============================================================
+//  Confidence Scoring
+// ============================================================
+ThreatScore calculateThreat(
+  bool rfConfirmed, float burstRate,
+  int unknownWiFi, int knownWiFi,
+  int unknownBLE,  int knownBLE,
+  int sniffedUnknown, int sniffedKnown,
+  bool teacherPresent, float rfDiff
+) {
+  ThreatScore t={0,"SAFE","No activity"};
+  if(rfConfirmed)                                       {t.score+=30;t.reason="RF detected";}
+  if(burstRate>=GSM_BURST_MIN&&burstRate<=GSM_BURST_MAX){t.score+=25;t.reason="GSM burst";}
+  if(unknownWiFi>0)   {t.score+=30*unknownWiFi;t.reason="Unknown WiFi device";}
+  if(unknownBLE>0)    {t.score+=20*unknownBLE; t.reason="Unknown BLE device";}
+  if(sniffedUnknown>0){t.score+=25;            t.reason="Device sniffed";}
+  if(baselineSet&&rfDiff>EXTRA_RF_THRESHOLD)  {t.score+=30;t.reason="Mobile data user";}
+  if(rfConfirmed&&!teacherPresent&&unknownWiFi==0&&unknownBLE==0&&sniffedUnknown==0)
+                                              {t.score+=20;t.reason="Unidentified RF";}
+  if(teacherPresent&&knownWiFi>0) t.score-=15;
+  if(teacherPresent&&knownBLE>0)  t.score-=10;
+  if(sniffedKnown>0)              t.score-=10;
+  t.score=constrain(t.score,0,100);
+  if     (t.score>=80) t.level="CRITICAL";
+  else if(t.score>=60) t.level="HIGH";
+  else if(t.score>=40) t.level="MEDIUM";
+  else if(t.score>=20) t.level="LOW";
+  else                 t.level="SAFE";
+  return t;
+}
+
+// ============================================================
+//  ThingSpeak Upload - USING HTTPClient (MORE RELIABLE)
+// ============================================================
+void uploadToThingSpeak(ThreatScore threat, bool teacherPresent,
+                        ScanResults res, float battV) {
+
+  // Check WiFi
+  if(WiFi.status() != WL_CONNECTED) {
+    Serial.println("ThingSpeak: WiFi Offline - Skipping");
+    return;
+  }
+  
+  // Rate limit
+  if(millis() - lastUpload < TS_INTERVAL) {
+    return; 
+  }
+
+  int totalUnknown = res.unknownWiFi + res.unknownBLE + res.sniffedUnknown;
+  int knownTotal = res.knownWiFi + res.knownBLE + res.sniffedKnown;
+  int teacherVal = teacherPresent ? 1 : 0;
+  
+  // Build the URL with all 8 fields
+  String url = "http://api.thingspeak.com/update?api_key=";
+  url += CH_WRITE;
+  url += "&field1=" + String(rfState.averaged);
+  url += "&field2=" + String(threat.score);
+  url += "&field3=" + String(totalUnknown);
+  url += "&field4=" + String(teacherVal);
+  url += "&field5=" + String((int)rfState.burstRate);
+  url += "&field6=" + String(totalAlerts);
+  url += "&field7=" + String(knownTotal);
+  url += "&field8=" + String((int)(battV * 10));
+  
+  Serial.println("\n=== ThingSpeak Upload (HTTP Method) ===");
+  Serial.println("URL: " + url);
+  
+  HTTPClient http;
+  http.begin(url);  // Use HTTP (not HTTPS) for reliability
+  
+  int httpCode = http.GET();
+  
+  if(httpCode > 0) {
+    String payload = http.getString();
+    Serial.print("Response Code: ");
+    Serial.println(httpCode);
+    Serial.print("Response Body: ");
+    Serial.println(payload);
+    
+    if(httpCode == 200) {
+      Serial.println("✅ ThingSpeak UPLOAD SUCCESS!");
+    } else {
+      Serial.println("❌ ThingSpeak upload failed with HTTP code: " + String(httpCode));
+    }
+  } else {
+    Serial.print("❌ HTTP GET failed, error: ");
+    Serial.println(httpCode);
+  }
+  
+  http.end();
+
+  lastUpload = millis();
+  Serial.println("=== End Upload ===\n");
+}
+
+// ============================================================
+//  Alert
+// ============================================================
+void triggerAlert(String level, String reason) {
+  totalAlerts++;
+  Serial.println("ALERT ["+level+"]: "+reason);
+  if     (level=="CRITICAL"){for(int i=0;i<10;i++){digitalWrite(BUZZER,HIGH);delay(80);digitalWrite(BUZZER,LOW);delay(50);}}
+  else if(level=="HIGH")    {for(int i=0;i< 5;i++){digitalWrite(BUZZER,HIGH);delay(150);digitalWrite(BUZZER,LOW);delay(100);}}
+  else if(level=="MEDIUM")  {for(int i=0;i< 3;i++){digitalWrite(BUZZER,HIGH);delay(200);digitalWrite(BUZZER,LOW);delay(150);}}
+  else                      {                       digitalWrite(BUZZER,HIGH);delay(300);digitalWrite(BUZZER,LOW);}
+}
+void clearAlert(){digitalWrite(BUZZER,LOW);}
+
+// ============================================================
+//  OLED
+// ============================================================
+void showOLED(String l1,String l2,String l3,String l4){
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(0, 0);display.println(l1);
+  display.setCursor(0,16);display.println(l2);
+  display.setCursor(0,32);display.println(l3);
+  display.setCursor(0,48);display.println(l4);
+  display.display();
+}
+
+void showMainDisplay(ThreatScore t,bool teacher,ScanResults res,float battV){
+  display.clearDisplay(); display.setTextColor(WHITE);
+  if(t.level!="SAFE"){
+    display.setTextSize(2); display.setCursor(0,0);
+    if     (t.level=="CRITICAL") display.print("CRITICAL");
+    else if(t.level=="HIGH")     display.print("HIGH!");
+    else if(t.level=="MEDIUM")   display.print("MEDIUM");
+    else                         display.print("LOW");
+  } else {
+    display.setTextSize(1); display.setCursor(0,0);
+    display.print("SAFE  RF:"); display.print(rfState.averaged);
+  }
+  display.setTextSize(1);
+  display.setCursor(0,20);
+  display.print("S:"); display.print(t.score);
+  display.print("% [");
+  int bars=map(t.score,0,100,0,8);
+  for(int i=0;i<bars;i++)  display.print("#");
+  for(int i=bars;i<8;i++) display.print(".");
+  display.print("]");
+  display.setCursor(0,32);
+  int unk=res.unknownWiFi+res.unknownBLE+res.sniffedUnknown;
+  display.print("Unknown:"); display.print(unk);
+  display.print(teacher?" T:Y":" T:N");
+  display.setCursor(0,48);
+  display.print("Alrt:"); display.print(totalAlerts);
+  display.print(" Bat:"); display.print(battV,1); display.print("V");
+  display.display();
+}
+
+// ============================================================
+//  Battery
+// ============================================================
+float readBattery(){
+  return (analogRead(BATTERY_PIN)/4095.0)*3.3*2.0;
+}
+
+// ============================================================
+//  Background Scan Task
+// ============================================================
+void scanTask(void* parameter){
+  while(true){
+    ScanResults results={0,0,0,0,0,0,false};
+    results.teacherOnHotspot=isTeacherOnHotspot();
+
+    int n=WiFi.scanNetworks(false,true);
+    for(int i=0;i<n;i++){
+      String mac=WiFi.BSSIDstr(i); int rssi=WiFi.RSSI(i); mac.toUpperCase();
+      if(rssi>RSSI_NEAR){
+        if(enrollMode){addToWhitelist(mac);enrollMode=false;}
+        else if(isWhitelisted(mac)){results.knownWiFi++;knownDevicesSeen++;}
+        else results.unknownWiFi++;
+      }
+    }
+    WiFi.scanDelete();
+
+    BLEScanResults* found=pBLEScan->start(2,false);
+    for(int i=0;i<found->getCount();i++){
+      BLEAdvertisedDevice dev=found->getDevice(i);
+      String mac=String(dev.getAddress().toString().c_str()); mac.toUpperCase();
+      if(dev.getRSSI()>RSSI_NEAR){
+        if(enrollMode){addToWhitelist(mac);enrollMode=false;}
+        else if(isWhitelisted(mac)) results.knownBLE++;
+        else results.unknownBLE++;
+      }
+    }
     pBLEScan->clearResults();
 
-    int score = constrain(map(cb.unknownCount, 0, 6, 0, 100), 0, 100);
+    startSniffing();
+    vTaskDelay(pdMS_TO_TICKS(SNIFF_DURATION));
+    stopSniffing();
 
-    xSemaphoreTake(scoreMutex, portMAX_DELAY);
-    g_bleScore = score;
-    xSemaphoreGive(scoreMutex);
+    if(xSemaphoreTake(sniffMutex,100)==pdTRUE){
+      for(int i=0;i<sniffCount;i++){
+        if(isWhitelisted(sniffBuffer[i].mac)) results.sniffedKnown++;
+        else results.sniffedUnknown++;
+      }
+      xSemaphoreGive(sniffMutex);
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_INTERVAL_MS));
+    if(xSemaphoreTake(resultMutex,100)==pdTRUE){scanResults=results;xSemaphoreGive(resultMutex);}
+
+    if(WiFi.status()!=WL_CONNECTED){
+      WiFi.begin(ssid,password);
+      int tries=0;
+      while(WiFi.status()!=WL_CONNECTED&&tries<10){vTaskDelay(pdMS_TO_TICKS(500));tries++;}
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
-// ---------------------------------------------------------------------
-// ThingSpeak Upload
-// ---------------------------------------------------------------------
-void uploadToThingSpeak(int rf, int wifi, int ble, int combined, ThreatLevel level) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  String url = "http://api.thingspeak.com/update?api_key=" + String(THINGSPEAK_API_KEY)
-             + "&field1=" + String(rf)
-             + "&field2=" + String(wifi)
-             + "&field3=" + String(ble)
-             + "&field4=" + String(combined)
-             + "&field5=" + String(level);
-  http.begin(url);
-  http.GET();
-  http.end();
-}
-
-// ---------------------------------------------------------------------
-// OLED Display
-// ---------------------------------------------------------------------
-void updateDisplay(int rf, int wifi, int ble, int combined, ThreatLevel level) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.printf("RF:%3d  WiFi:%3d  BLE:%3d\n", rf, wifi, ble);
-
-  display.setTextSize(2);
-  display.setCursor(0, 16);
-  display.printf("%s", scorer.levelName(level));
-
-  display.setTextSize(1);
-  display.setCursor(0, 40);
-  display.printf("Score: %d%%\n", combined);
-
-  display.drawRect(0, 52, 128, 10, SSD1306_WHITE);
-  int fillWidth = map(combined, 0, 100, 0, 126);
-  display.fillRect(1, 53, fillWidth, 8, SSD1306_WHITE);
-
-  display.display();
-}
-
-void updateIndicators(ThreatLevel level) {
-  digitalWrite(LED_SAFE_PIN, level == SAFE);
-  digitalWrite(LED_WARNING_PIN, level == WARNING);
-  digitalWrite(LED_CRITICAL_PIN, level == CRITICAL);
-  digitalWrite(BUZZER_PIN, level == CRITICAL);
-}
-
-// ---------------------------------------------------------------------
-// Setup / Loop (run on Core 1's Arduino loop task by default)
-// ---------------------------------------------------------------------
-void setup() {
+// ============================================================
+//  SETUP
+// ============================================================
+void setup(){
   Serial.begin(115200);
+  Serial.println("\n\n=== Tri-Layer Smart Detector ===");
+  
+  pinMode(BUZZER,OUTPUT); pinMode(ENROLL_BTN,INPUT_PULLUP);
+  digitalWrite(BUZZER,LOW);
+  sniffMutex=xSemaphoreCreateMutex(); resultMutex=xSemaphoreCreateMutex();
 
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_SAFE_PIN, OUTPUT);
-  pinMode(LED_WARNING_PIN, OUTPUT);
-  pinMode(LED_CRITICAL_PIN, OUTPUT);
-  pinMode(CALIBRATION_BTN_PIN, INPUT_PULLUP);
-  analogReadResolution(12);
+  if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C)) Serial.println("OLED not found");
+  showOLED("Smart Detector","MGIT ECE","Starting...","");
+  delay(1500);
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
-  display.clearDisplay();
-  display.display();
+  EEPROM.begin(EEPROM_SIZE); loadWhitelist();
 
-  whitelist.begin();
-  scoreMutex = xSemaphoreCreateMutex();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID,AP_PASS);
+  showOLED("Connecting WiFi",ssid,"Please wait...","");
+  WiFi.begin(ssid,password);
+  int tries=0;
+  while(WiFi.status()!=WL_CONNECTED&&tries<20){delay(500);tries++;}
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    delay(300);
-    Serial.print(".");
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.println("✅ WiFi Connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("❌ WiFi Connection Failed!");
   }
-  Serial.println(WiFi.status() == WL_CONNECTED ? " connected" : " continuing offline");
+  
+  BLEDevice::init("ESP32_Detector");
+  pBLEScan=BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
 
-  // Pin RF sensing task to Core 1, WiFi/BLE task to Core 0
-  xTaskCreatePinnedToCore(rfSensingTask, "RFSense", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(wifiScanTask,  "WiFiScan", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(bleScanTask,   "BLEScan",  8192, NULL, 1, NULL, 0);
+  showOLED("System Ready!",
+           "AP: "+String(AP_SSID),
+           "WiFi: "+String(WiFi.status()==WL_CONNECTED?"OK":"Offline"),
+           "HTTP Upload Mode");
+  delay(2000);
 
-  Serial.println("Tri-layer detection system online.");
+  xTaskCreatePinnedToCore(scanTask,"ScanTask",16384,NULL,1,NULL,0);
 }
 
-void loop() {
-  // Calibration: hold the button on boot/runtime to set current RF
-  // reading + treat currently visible devices as the whitelist baseline.
-  g_calibrationMode = (digitalRead(CALIBRATION_BTN_PIN) == LOW);
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop(){
 
-  int rf, wifi, ble;
-  xSemaphoreTake(scoreMutex, portMAX_DELAY);
-  rf = g_rfScore;
-  wifi = g_wifiScore;
-  ble = g_bleScore;
-  xSemaphoreGive(scoreMutex);
-
-  int combined = scorer.compute(rf, wifi, ble);
-  ThreatLevel level = scorer.classify(combined);
-
-  updateDisplay(rf, wifi, ble, combined, level);
-  updateIndicators(level);
-
-  static uint32_t lastUpload = 0;
-  if (millis() - lastUpload > THINGSPEAK_UPLOAD_INTERVAL_MS) {
-    uploadToThingSpeak(rf, wifi, ble, combined, level);
-    lastUpload = millis();
+  if(digitalRead(ENROLL_BTN)==LOW){
+    delay(50);
+    if(digitalRead(ENROLL_BTN)==LOW){
+      enrollMode=true; enrollStart=millis();
+      showOLED("ENROLL MODE","Bring teacher","phone near now","10 sec timeout");
+      for(int i=0;i<3;i++){digitalWrite(BUZZER,HIGH);delay(100);digitalWrite(BUZZER,LOW);delay(100);}
+    }
   }
+  if(enrollMode&&millis()-enrollStart>10000){enrollMode=false;showOLED("Enroll timeout","","","");delay(1000);}
 
-  Serial.printf("RF:%d WiFi:%d BLE:%d -> Combined:%d [%s]\n",
-                rf, wifi, ble, combined, scorer.levelName(level));
+  bool rfConfirmed=checkRFDebounced();
+  if(rfConfirmed) rfState.burstRate=detectGSMBurst();
 
-  delay(500);
+  bool teacherNow=false;
+  ScanResults results;
+  if(xSemaphoreTake(resultMutex,50)==pdTRUE){teacherNow=scanResults.teacherOnHotspot;results=scanResults;xSemaphoreGive(resultMutex);}
+
+  if(teacherNow&&!prevTeacher){
+    teacherBaseline=readRFAveraged(); baselineSet=true;
+    showOLED("Teacher found!","Baseline set!","RF:"+String((int)teacherBaseline),"");delay(1000);
+  }
+  if(!teacherNow&&prevTeacher&&baselineSet){baselineSet=false;teacherBaseline=0;}
+  prevTeacher=teacherNow;
+
+  float rfDiff=rfState.averaged-teacherBaseline;
+  bool teacherPresent=teacherNow||results.knownWiFi>0||results.knownBLE>0||results.sniffedKnown>0;
+
+  ThreatScore threat=calculateThreat(
+    rfConfirmed,rfState.burstRate,
+    results.unknownWiFi,results.knownWiFi,
+    results.unknownBLE, results.knownBLE,
+    results.sniffedUnknown,results.sniffedKnown,
+    teacherPresent,rfDiff
+  );
+
+  if(threat.score>peakScore) peakScore=threat.score;
+  currentScore=threat.score; currentLevel=threat.level;
+
+  if(threat.level!="SAFE") triggerAlert(threat.level,threat.reason);
+  else clearAlert();
+
+  float battV=readBattery();
+  showMainDisplay(threat,teacherPresent,results,battV);
+  
+  uploadToThingSpeak(threat, teacherPresent, results, battV);
+
+  Serial.print("RF:"+String(rfState.averaged));
+  Serial.print(" S:"+String(threat.score)+"%");
+  Serial.print(" ["+threat.level+"]");
+  Serial.print(" U:"+String(results.unknownWiFi+results.unknownBLE+results.sniffedUnknown));
+  Serial.print(" T:"+String(teacherPresent?"Y":"N"));
+  Serial.print(" A:"+String(totalAlerts));
+  Serial.println();
+  
+  delay(1000);
 }
